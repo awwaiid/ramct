@@ -1,0 +1,211 @@
+#!/usr/bin/env perl
+
+# Scrape some webct!
+
+use strict;
+use WWW::Mechanize;
+use Config::Any;
+use DBM::Deep;
+use MIME::Lite;
+use Web::Query;
+
+$| = 1;
+
+my $configfile = "$ENV{HOME}/.ramct.ini";
+my $config = Config::Any->load_files({
+  files           => [ $configfile ],
+  flatten_to_hash => 1,
+  use_ext         => 1,
+});
+$config = $config->{$configfile};
+
+my $webct_base = $config->{baseurl};
+
+my $db_filename = $config->{dbfile};
+my $db = DBM::Deep->new( $db_filename );
+
+# foreach my $id (keys %{$db->{msg}}) {
+  # $db->{msg}->{$id}->{email_sent} = 0;
+# }
+# exit;
+
+sub authenticate {
+  my $b = shift;
+
+  $b->get($webct_base);
+  my $c = $b->content;
+
+  # Grab out the important bits so we don't have to do any JS
+  $c =~ /
+    glcid.value\ =\ "([^"]+)"
+    .*
+    insId.value\ =\ "([^"]+)"
+    .*
+    insName.value\ =\ "([^"]+)"
+    .*
+    newUserGlcid.value\ =\ "([^"]+)"
+  /ixms;
+
+  my ($glcid, $insId, $insName, $newUserGlcid) = ($1, $2, $3, $4);
+
+  $b->current_form->action("$webct_base/authenticateUser.dowebct");
+
+  $b->submit_form( with_fields => {
+    webctid        => $config->{username},
+    password       => $config->{password},
+    glcid          => $glcid,
+    insId          => $insId,
+    insName        => $insName,
+    newUserGlcid   => $newUserGlcid,
+    timeZoneOffset => 5,
+    insLoginFlag   => 'insLoginFlagYes',
+    actionType     => '',
+  });
+}
+
+sub get_courses {
+  my $b = shift;
+  $b->follow_link(name => 'APPLICATION_FRAME');
+  $b->follow_link(name => 'TOPAPPFRAME');
+  my $base_uri = $b->uri;
+  $base_uri =~ s/^(.*)\/.*$/$1/;
+  $b->get("$base_uri/populateMyWebCT.dowebct");
+
+  my $course_links = $b->find_link( url_regex => qr/CourseView/, n => 10 );
+  foreach my $l (@$course_links) {
+    print "Course: " . $l->text . "\n";
+  }
+  # Grab the first one
+  $b->follow_link( url_regex => qr/CourseView/ );
+}
+
+sub get_message_list {
+  my $b = shift;
+  # Works, shows first block
+  $b->get($webct_base . '/newMessageThread.dowebct?Data=&PageAction=&addComments=&alltopics=&areaid=&collatorFactoryClass=&compileaction=&discussionaction=mDisplay&exp=&instructions=&messageid=&messageids=&msgListing=alltopics&msgsortaction=&ratingInstruction=&sd=&showIndices=true&sortAttribute=&sortOrder=sortUp&starRatingString=&topicDetailsToggleState=&topicIds=&topicIds=&topicid=&totopicid=&view=Unthreaded&viewtype=');
+
+  # Then get full list
+  $b->get($webct_base . '/newMessageThread.dowebct?discussionaction=mDisplay&view=Unthreaded&msgListing=alltopics&homePage=null&Data=12&PageAction=MoveToPage&addComments=&alltopics=&areaid=&collatorFactoryClass=&compileaction=&discussionaction=mDisplay&dropDowns0=All&dropDowns1=1-10&exp=&instructions=&messageid=&messageids=&msgListing=alltopics&msgsortaction=&ratingInstruction=&sd=&showIndices=true&sortAttribute=&sortOrder=sortUp&starRatingString=&topicDetailsToggleState=&topicIds=&topicIds=&topicid=&totopicid=&view=Unthreaded&viewtype=');
+
+  my $q = Web::Query->new_from_html($b->content);
+  my $data = $q->find('#datatable');
+  my $raw_msg = {};
+  $data->find('tr')
+    ->each(sub {
+      my ($i, $n) = @_;
+      my $id = $n->attr('id');
+      my @row;
+      $n->find('td')->each(sub {
+        # print $_->text() . "\t";
+        my $t = $_->text();
+        $t =~ s/^\s*(.*?)\s*$/$1/; # trim!
+        push @row, $t;
+      });
+      my $link = $n->find('a')->first()->attr('href');
+      $link =~ /messageid=(\d+)&topicid=(\d+)/;
+      push @row, $1, $2;
+      # print "\n";
+      $raw_msg->{$id} = [@row];
+    });
+    return $raw_msg;
+}
+
+
+sub update_db {
+  my ($b, $raw_msg) = @_;
+  my $msg = {};
+  foreach my $rowid (keys %$raw_msg) {
+    my $id = $rowid;
+    $id =~ s/^row//;
+    next if !$id;
+    $db->{msg}->{$id} ||= {
+      subject   => $raw_msg->{$rowid}[2],
+      topic     => $raw_msg->{$rowid}[4],
+      author    => $raw_msg->{$rowid}[6],
+      date      => $raw_msg->{$rowid}[7],
+      messageid => $raw_msg->{$rowid}[8],
+      topicid   => $raw_msg->{$rowid}[9],
+     };
+     if(! $db->{msg}->{$id}->{content}) {
+       my $topicid = $raw_msg->{$rowid}[9];
+       $b->get("$webct_base/newMessageThread.dowebct?discussionaction=viewMessage&messageid=$id&topicid=$topicid&refreshPage=false&sourcePage=");
+       my $q = Web::Query->new_from_html($b->content);
+       $db->{msg}->{$id}->{content} = $q->find('.entrytext div')->first()->html();
+     }
+  }
+}
+
+sub logout {
+  my ($b) = @_;
+  $b->get("$webct_base/logout.dowebct");
+}
+
+use Digest::MD5 qw(md5_base64);
+sub send_new_messages {
+  # Check for emailed entries
+  foreach my $id (sort keys %{$db->{msg}}) {
+    my $msg = $db->{msg}{$id};
+    next if $msg->{email_sent};
+    my $author = $msg->{author};
+    $author =~ s/\s*\(\)$//;
+    $author =~ s/^([^,]+),\s*(.*)$/$2 $1/;
+
+    # Build a message ID for this thread
+    my $message_id = "<$id.ramct\@thelackthereof.org>";
+    my $thread_id = $message_id;
+    print "Subject: $msg->{subject} [$author | $msg->{topic}]\n";
+    print "Message-ID: $message_id\n";
+    if($msg->{subject} =~ /^re:(.*)$/i) {
+      my $subject = $1;
+      # Brute force look for original
+      foreach my $id (sort keys %{$db->{msg}}) {
+        if($db->{msg}->{$id}->{subject} eq $subject) {
+          $thread_id = "<$id.ramct\@thelackthereof.org>";
+          print "Detected reply-to: $thread_id\n";
+          last;
+        }
+      }
+    }
+
+    my $email = MIME::Lite->new(
+      'Message-ID'   => $message_id,
+      ( $message_id eq $thread_id ? () : ('In-Reply-To:' => $thread_id)),
+      From           => "\"$author\" <$config->{smtpfrom}>",
+      To             => $config->{smtpto},
+      Subject        => "$msg->{subject} [$msg->{topic}]",
+      Type           => 'text/html',
+      Data           => "
+        (Sent $msg->{date})<br>
+        <br>
+        $msg->{content}
+        <br>
+        <hr>
+        [$author | $msg->{topic}]
+      ",
+    );
+    $email->send(
+      smtp     => $config->{smtphost},
+      Port     => $config->{smtpport},
+      AuthUser => $config->{smtpuser},
+      AuthPass => $config->{smtppass},
+    ) || die "Error sending: $!";
+    $msg->{email_sent} = 1;
+  }
+  print "\n";
+}
+
+my $b = WWW::Mechanize->new;
+print "Authenticating.\n";
+authenticate($b);
+print "Getting course list.\n";
+get_courses($b);
+print "Getting message list.\n";
+my $message_list = get_message_list($b);
+print "Adding new messages to DB.\n";
+update_db($b, $message_list);
+print "Logging out. Why not? :)\n";
+logout($b);
+print "Emailing new messages.\n";
+send_new_messages();
+
+

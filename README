@@ -1,0 +1,41 @@
+I got tired of reloading RamCT (A WebCT implementation at Colorado State
+University, where i'm taking an online class). So I scraped the forum and
+have it email to me :)
+
+You can attempt to use it if you like. On the random box I'm running on I had
+to install these deps (don't know what I already had). I chose to install
+what I could from apt, and the rest from CPAN directly (using cpanminus,
+which is in apt).
+
+From apt-get:
+
+  sudo apt-get install cpanminus libconfig-any-perl \
+    libdbm-deep-perl libmime-lite-perl libauthen-sasl-perl
+
+And directly from CPAN:
+
+  sudo cpanm Web::Query
+
+For configuration, I created ~/.ramct.ini, filling in all of the missing
+values:
+
+username = 
+password = 
+baseurl  = https://ramct.colostate.edu/webct
+dbfile   = /home/yourusername/.ramct.db
+smtphost = 
+smtpuser = 
+smtppass = 
+smtpport = 
+smtpfrom = 
+smtpto   = 
+
+the .ramct.db is a DBM::Deep hash of all the messages.
+
+This just _barely_ works for my needs, and will almost definitely need tweaks
+for anyone else. For example, it just selects the first class on your list
+for now.
+
+Also - I hear they are upgrading ramct in the summer, so this may be a very
+short-lived hack :)
+
